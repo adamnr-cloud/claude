@@ -1,0 +1,36 @@
+From 8679dd559b00b5e0c80d21f9703e03d562e59434 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 16:31:48 +0000
+Subject: [PATCH 1/3] multiboot: Fix offset of the framebuffer colour
+ information
+
+GRUB, like the example header in the multiboot specification, does not
+pack struct multiboot_info, so the union holding the palette or RGB
+field layout is aligned to 4 bytes and starts at offset 112, not right
+after framebuffer_type at offset 110.  Reading it at 110 gives shifted
+field positions and mask sizes, e.g. red 0:0 green 16:8 blue 8:8 for a
+plain XRGB8888 framebuffer.
+
+Add the two bytes of padding GRUB leaves before the union.
+---
+ i386/include/mach/i386/multiboot.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/i386/include/mach/i386/multiboot.h b/i386/include/mach/i386/multiboot.h
+index 8df5261f4..085fcaad4 100644
+--- a/i386/include/mach/i386/multiboot.h
++++ b/i386/include/mach/i386/multiboot.h
+@@ -222,6 +222,10 @@ struct multiboot_framebuffer_info {
+ #define MULTIBOOT_FRAMEBUFFER_TYPE_RGB		1
+ #define MULTIBOOT_FRAMEBUFFER_TYPE_EGA_TEXT	2
+     uint8_t framebuffer_type;
++    /* The multiboot specification text puts the colour information right
++       after framebuffer_type, but GRUB, like the specification's own example
++       header, aligns the union to 4 bytes.  Follow what boot loaders do.  */
++    uint16_t framebuffer_reserved;
+     union
+     {
+         struct
+-- 
+2.43.0
+

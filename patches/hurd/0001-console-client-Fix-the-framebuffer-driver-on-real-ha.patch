@@ -1,0 +1,404 @@
+From 4a9711581984a3b1d250829f1d37bfa514a8c08e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 16:35:09 +0000
+Subject: [PATCH 1/2] console-client: Fix the framebuffer driver on real
+ hardware
+
+The fb driver assumed the framebuffer is exactly width * bpp/8 bytes per
+scan line and that pixels are stored red, green, blue in memory.  Neither
+holds on e.g. a 1366x768 ThinkPad panel under coreboot, where the pitch
+is 5504 bytes rather than 5464 and pixels are XRGB8888, so the console
+came out sheared, with red and blue swapped.
+
+- Use framebuffer_pitch for addressing, mapping, clearing and scrolling.
+- Build pixel values from the RGB field positions and mask sizes, and
+  support 16, 24 and 32 bpp.
+- Read the colour information at the offset GRUB actually uses: its
+  multiboot_info aligns that union to 4 bytes (offset 112, not 110).
+  Only read up to the colour information, which older kernels provide.
+- Require the framebuffer flag and RGB type before switching to fb.
+- Clamp the text area to the size the cell bookkeeping is allocated for,
+  and index that bookkeeping by row and column.
+- Free the device_read buffer when it was returned out of line.
+---
+ console-client/fb.c | 166 ++++++++++++++++++++++++++++----------------
+ console-client/fb.h |   6 ++
+ 2 files changed, 112 insertions(+), 60 deletions(-)
+
+diff --git a/console-client/fb.c b/console-client/fb.c
+index f4b76aec..63e7ace2 100644
+--- a/console-client/fb.c
++++ b/console-client/fb.c
+@@ -25,6 +25,7 @@
+ #include <iconv.h>
+ #include <argp.h>
+ #include <string.h>
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #include <sys/io.h>
+@@ -53,9 +54,15 @@ int fb_type;
+ static int fb_width;
+ static int fb_height;
+ static int fb_bpp;
++static int fb_pitch;		/* Bytes per scan line.  */
+ static int fb_wc;
+ static int fb_hc;
+ 
++/* Layout of a pixel: bit position and size of each colour channel.  */
++static int fb_red_pos, fb_red_size;
++static int fb_green_pos, fb_green_size;
++static int fb_blue_pos, fb_blue_size;
++
+ static unsigned char question_mark[32] = {
+ 	0x7E,	/*  ******  */
+ 	0xC3,	/* **    ** */
+@@ -93,7 +100,7 @@ static int current_height;
+ static int current_fg = 7;
+ static int current_bg = 0;
+ 
+-#define fb_pos(_col, _row) (vga_videomem + fb_bpp/8 * ( (_row) * fb_hc * disp->width + (_col) * fb_wc ))
++#define fb_pos(_col, _row) (vga_videomem + (_row) * fb_hc * fb_pitch + (_col) * fb_wc * fb_bpp/8)
+ #define CURSOR_GLYPH	0x2581
+ #define CURSOR_COLOUR	7
+ 
+@@ -109,7 +116,10 @@ fb_get_multiboot_params (void)
+   struct multiboot_raw_info mbi;
+   char buf[sizeof(struct multiboot_raw_info)];
+   char *bufptr = &buf[0];
+-  uint32_t bytes = sizeof(struct multiboot_raw_info);
++  /* Only read up to the colour information: older kernels expose a
++     multiboot_raw_info that ends right after it.  */
++  uint32_t bytes = offsetof (struct multiboot_raw_info,
++			     fb_info.framebuffer_blue_mask_size) + 1;
+   uint32_t bytes_read = 0;
+ 
+   ret = get_privileged_ports (NULL, &master_device);
+@@ -129,15 +139,36 @@ fb_get_multiboot_params (void)
+   if (bytes_read != bytes)
+     goto fail;
+ 
+-  memcpy((void *)&mbi, (void *)bufptr, sizeof(struct multiboot_raw_info));
++  memset (&mbi, 0, sizeof mbi);
++  memcpy ((void *)&mbi, (void *)bufptr, bytes);
++  if (bufptr != &buf[0])
++    vm_deallocate (mach_task_self (), (vm_address_t) bufptr, bytes_read);
+ 
++  if (!(mbi.flags & MULTIBOOT_FRAMEBUFFER))
++    goto fail;
++  if (mbi.fb_info.framebuffer_type != MULTIBOOT_FRAMEBUFFER_TYPE_RGB)
++    goto fail;
++  fb_bpp = mbi.fb_info.framebuffer_bpp;
++  if (fb_bpp != 16 && fb_bpp != 24 && fb_bpp != 32)
++    goto fail;
+   fb_width = mbi.fb_info.framebuffer_width;
+   fb_height = mbi.fb_info.framebuffer_height;
+-  if (fb_width == 0 || fb_height == 0)
++  fb_pitch = mbi.fb_info.framebuffer_pitch;
++  if (fb_width == 0 || fb_height == 0 || fb_pitch < fb_width * fb_bpp/8)
+     goto fail;
++  /* The character cell bookkeeping is sized for at most this.  */
++  if (fb_width > FB_VIDEO_MEM_MAX_W)
++    fb_width = FB_VIDEO_MEM_MAX_W;
++  if (fb_height > FB_VIDEO_MEM_MAX_H)
++    fb_height = FB_VIDEO_MEM_MAX_H;
+   fb_ptr = mbi.fb_info.framebuffer_addr;
+   fb_type = mbi.fb_info.framebuffer_type;
+-  fb_bpp = mbi.fb_info.framebuffer_bpp;
++  fb_red_pos = mbi.fb_info.framebuffer_red_field_position;
++  fb_red_size = mbi.fb_info.framebuffer_red_mask_size;
++  fb_green_pos = mbi.fb_info.framebuffer_green_field_position;
++  fb_green_size = mbi.fb_info.framebuffer_green_mask_size;
++  fb_blue_pos = mbi.fb_info.framebuffer_blue_field_position;
++  fb_blue_size = mbi.fb_info.framebuffer_blue_mask_size;
+   fb_wc = FONT_PIXELS_W;
+   fb_hc = FONT_PIXELS_H;
+   return ret;
+@@ -162,33 +193,47 @@ always_find_glyph(bdf_font_t f, int ch)
+   return g;
+ }
+ 
+-static void
+-blit_glyph(bdf_font_t f, char *mem, int ch, uint32_t fg, uint32_t bg, int width, int bpp)
++/* Scale the 8-bit channel VALUE to SIZE bits and place it at bit POS.  */
++static uint32_t
++fb_channel (uint32_t value, int size, int pos)
+ {
+-  int w, h;
++  if (size == 0)
++    return 0;
++  if (size < 8)
++    value >>= 8 - size;
++  else
++    value <<= size - 8;
++  return value << pos;
++}
+ 
+-  struct bdf_glyph *gl = always_find_glyph(f, ch);
++/* Convert COLOUR, given as 0xRRGGBB, to the framebuffer's pixel format.  */
++static uint32_t
++fb_pixel (uint32_t colour)
++{
++  return fb_channel ((colour >> 16) & 0xff, fb_red_size, fb_red_pos)
++	 | fb_channel ((colour >> 8) & 0xff, fb_green_size, fb_green_pos)
++	 | fb_channel (colour & 0xff, fb_blue_size, fb_blue_pos);
++}
+ 
+-  if (bg == -1)
+-    bg = current_bg;
+-  if (fg == -1)
+-    fg = current_fg;
++static void
++put_pixel (char *p, uint32_t pixel, int xor)
++{
++  int i;
+ 
+-  for (h = 0; h < fb_hc; h++)
++  /* Byte by byte, in little-endian order, so that 24 bpp works too.  */
++  for (i = 0; i < fb_bpp/8; i++)
+     {
+-      for (w = 0; w < fb_wc; w++)
+-        {
+-          char *pixel = mem + bpp/8 * (w + width * h);
+-          uint32_t colour = (gl->bitmap[h] & (1 << (7-w))) ? fg : bg;
+-          pixel[0] = (colour >> 16) & 0xff;
+-          pixel[1] = (colour >> 8) & 0xff;
+-          pixel[2] = colour & 0xff;
+-        }
++      unsigned char byte = pixel >> (8 * i);
++      if (xor)
++	((volatile unsigned char *) p)[i] ^= byte;
++      else
++	((volatile unsigned char *) p)[i] = byte;
+     }
+ }
+ 
+ static void
+-blit_glyph_xor(bdf_font_t f, char *mem, int ch, uint32_t fg, uint32_t bg, int width, int bpp)
++blit_glyph_common (bdf_font_t f, char *mem, int ch, uint32_t fg, uint32_t bg,
++		   int xor)
+ {
+   int w, h;
+ 
+@@ -198,20 +243,32 @@ blit_glyph_xor(bdf_font_t f, char *mem, int ch, uint32_t fg, uint32_t bg, int wi
+     bg = current_bg;
+   if (fg == -1)
+     fg = current_fg;
++  fg = fb_pixel (fg);
++  bg = fb_pixel (bg);
+ 
+   for (h = 0; h < fb_hc; h++)
+     {
+       for (w = 0; w < fb_wc; w++)
+         {
+-          char *pixel = mem + bpp/8 * (w + width * h);
++          char *pixel = mem + h * fb_pitch + w * fb_bpp/8;
+           uint32_t colour = (gl->bitmap[h] & (1 << (7-w))) ? fg : bg;
+-          pixel[0] ^= (colour >> 16) & 0xff;
+-          pixel[1] ^= (colour >> 8) & 0xff;
+-          pixel[2] ^= colour & 0xff;
++          put_pixel (pixel, colour, xor);
+         }
+     }
+ }
+ 
++static void
++blit_glyph(bdf_font_t f, char *mem, int ch, uint32_t fg, uint32_t bg)
++{
++  blit_glyph_common (f, mem, ch, fg, bg, 0);
++}
++
++static void
++blit_glyph_xor(bdf_font_t f, char *mem, int ch, uint32_t fg, uint32_t bg)
++{
++  blit_glyph_common (f, mem, ch, fg, bg, 1);
++}
++
+ static error_t
+ fb_init(void)
+ {
+@@ -222,7 +279,7 @@ fb_init(void)
+   if (fd < 0)
+     return errno;
+ 
+-  vga_videomem = mmap (0, fb_width * fb_height * fb_bpp/8, PROT_READ | PROT_WRITE,
++  vga_videomem = mmap (0, fb_pitch * fb_height, PROT_READ | PROT_WRITE,
+ 		       MAP_SHARED, fd, fb_ptr);
+   err = errno;
+   close (fd);
+@@ -230,14 +287,14 @@ fb_init(void)
+     return err;
+ 
+   /* Clear screen */
+-  vga_memset (vga_videomem, 0, fb_width * fb_height * fb_bpp/8);
++  vga_memset (vga_videomem, 0, fb_pitch * fb_height);
+   return 0;
+ }
+ 
+ static void
+ fb_fini(void)
+ {
+-  munmap (vga_videomem, fb_width * fb_height * fb_bpp/8);
++  munmap (vga_videomem, fb_pitch * fb_height);
+ }
+ 
+ /* Start the driver.  */
+@@ -334,7 +391,7 @@ hide_mousecursor (struct fb_display *disp)
+     return;
+ 
+   /* First remove the old cursor.  */
+-  blit_glyph_xor (disp->font, oldpos, 'X', 0x00ff00, -1, disp->width, fb_bpp);
++  blit_glyph_xor (disp->font, oldpos, 'X', 0x00ff00, -1);
+   disp->mousecursor.visible = 0;
+ }
+ 
+@@ -348,7 +405,7 @@ draw_mousecursor (struct fb_display *disp)
+     return;
+ 
+   /* Draw the new cursor.  */
+-  blit_glyph_xor (disp->font, newpos, 'X', 0x00ff00, -1, disp->width, fb_bpp);
++  blit_glyph_xor (disp->font, newpos, 'X', 0x00ff00, -1);
+ 
+   disp->mousecursor.visible = 1;
+ }
+@@ -364,7 +421,7 @@ hide_cursor(struct fb_display *disp)
+ 
+   /* Remove old cursor */
+   curpos = fb_pos(cursor_pos_x, cursor_pos_y);
+-  blit_glyph_xor (disp->font, curpos, CURSOR_GLYPH, ansi_colour[CURSOR_COLOUR], -1, disp->width, fb_bpp);
++  blit_glyph_xor (disp->font, curpos, CURSOR_GLYPH, ansi_colour[CURSOR_COLOUR], -1);
+   cursor_hidden = 1;
+ }
+ 
+@@ -378,7 +435,7 @@ draw_cursor(struct fb_display *disp)
+ 
+   /* Add new cursor */
+   curpos = fb_pos(cursor_pos_x, cursor_pos_y);
+-  blit_glyph_xor (disp->font, curpos, CURSOR_GLYPH, ansi_colour[CURSOR_COLOUR], -1, disp->width, fb_bpp);
++  blit_glyph_xor (disp->font, curpos, CURSOR_GLYPH, ansi_colour[CURSOR_COLOUR], -1);
+   cursor_hidden = 0;
+ }
+ 
+@@ -437,14 +494,14 @@ static error_t
+ fb_display_scroll (void *handle, int delta)
+ {
+   struct fb_display *disp = handle;
+-  int pixels, chars;
+-  uint32_t r;
++  size_t bytes, rows;
+ 
+   if (abs(delta) > disp->height/fb_hc)
+     return ENOTSUP;
+ 
+-  pixels = abs(delta)*fb_hc * disp->width;
+-  chars = abs(delta) * disp->width/fb_wc;
++  /* Bytes of framebuffer and text rows moved by the scroll.  */
++  bytes = (size_t) abs(delta) * fb_hc * fb_pitch;
++  rows = disp->height/fb_hc - abs(delta);
+ 
+   hide_mousecursor (disp);
+   hide_cursor (disp);
+@@ -456,26 +513,17 @@ fb_display_scroll (void *handle, int delta)
+ 
+   if (delta > 0)
+     {
+-      vga_memmove (vga_videomem, vga_videomem + fb_bpp/8 * pixels,
+-		    fb_bpp/8 * disp->width * (disp->height - delta*fb_hc));
+-    }
+-  else
+-    {
+-      vga_memmove (vga_videomem + fb_bpp/8 * pixels, vga_videomem,
+-		    fb_bpp/8 * disp->width * (disp->height + delta*fb_hc));
+-    }
+-
+-  if (delta > 0)
+-    {
+-      r = disp->height/fb_hc - delta;
+-      vga_memmove (&disp->refmatrix[0][0], &disp->refmatrix[0][0] + chars,
+-		    sizeof (struct fbchr) * disp->width/fb_wc * r);
++      vga_memmove (vga_videomem, vga_videomem + bytes,
++		    (size_t) fb_pitch * rows * fb_hc);
++      memmove (&disp->refmatrix[0], &disp->refmatrix[delta],
++	       sizeof disp->refmatrix[0] * rows);
+     }
+   else
+     {
+-      r = 0;
+-      vga_memmove (&disp->refmatrix[0][0] + chars, &disp->refmatrix[0][0],
+-		    sizeof (struct fbchr) * disp->width/fb_wc * (disp->height/fb_hc + delta));
++      vga_memmove (vga_videomem + bytes, vga_videomem,
++		    (size_t) fb_pitch * rows * fb_hc);
++      memmove (&disp->refmatrix[-delta], &disp->refmatrix[0],
++	       sizeof disp->refmatrix[0] * rows);
+     }
+ 
+   return 0;
+@@ -491,7 +539,7 @@ fb_display_write (void *handle, conchar_t *str, size_t length,
+ {
+   struct fb_display *disp = handle;
+   char *pos;
+-  struct fbchr *refpos = &disp->refmatrix[row][col];
++  struct fbchr *refpos;
+   char *mouse_cursor_pos;
+ 
+   hide_mousecursor (disp);
+@@ -517,8 +565,6 @@ fb_display_write (void *handle, conchar_t *str, size_t length,
+       /* The virtual console is smaller than the physical screen.  */
+       if (col >= current_width)
+         {
+-          size_t skip = disp->width/fb_wc - current_width;
+-          refpos += skip;
+           col = 0;
+           row += 1;
+         }
+@@ -537,13 +583,14 @@ fb_display_write (void *handle, conchar_t *str, size_t length,
+         return 0;
+ 
+       pos = fb_pos(col, row);
++      refpos = &disp->refmatrix[row][col];
+ 
+       /* blit glyph to screen */
+       fg = (str->attr.intensity == CONS_ATTR_INTENSITY_BOLD)
+          ? ansi_colour_bold[str->attr.fgcol]
+          : ansi_colour[str->attr.fgcol];
+       bg = ansi_colour[str->attr.bgcol];
+-      blit_glyph(disp->font, pos, charval, fg, bg, disp->width, fb_bpp);
++      blit_glyph(disp->font, pos, charval, fg, bg);
+ 
+       if (pos == mouse_cursor_pos)
+         disp->mousecursor.visible = 0;
+@@ -552,7 +599,6 @@ fb_display_write (void *handle, conchar_t *str, size_t length,
+       refpos->chr = charval;
+       refpos->fgcol = fg;
+       refpos->bgcol = bg;
+-      refpos++;
+       col++;
+ 
+       /* Go to next character.  */
+diff --git a/console-client/fb.h b/console-client/fb.h
+index 123ef978..bc526654 100644
+--- a/console-client/fb.h
++++ b/console-client/fb.h
+@@ -37,6 +37,9 @@ extern int fb_type;
+ error_t fb_get_multiboot_params (void);
+ error_t fb_display_init (void **handle, struct driver_ops *ops);
+ 
++/* Bit in multiboot_raw_info.flags telling fb_info is valid.  */
++#define MULTIBOOT_FRAMEBUFFER	0x00001000
++
+ struct multiboot_framebuffer_info {
+     uint64_t framebuffer_addr;
+     uint32_t framebuffer_pitch;
+@@ -47,6 +50,9 @@ struct multiboot_framebuffer_info {
+ #define MULTIBOOT_FRAMEBUFFER_TYPE_RGB          1
+ #define MULTIBOOT_FRAMEBUFFER_TYPE_EGA_TEXT     2
+     uint8_t framebuffer_type;
++    /* GRUB, like the example header in the multiboot specification, aligns
++       the colour information to 4 bytes.  */
++    uint16_t framebuffer_reserved;
+     union
+     {
+         struct
+-- 
+2.43.0
+

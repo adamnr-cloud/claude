@@ -1,0 +1,28 @@
+From 61a154c6034811c96e0e554caed9d0673db5aad2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 16:35:10 +0000
+Subject: [PATCH 2/2] console: Report --width with the width, not the number of
+ lines
+
+console_get_options printed cons->lines as the value of --width, so
+fsysopts showed a wrong width once it differed from the default.
+---
+ console/console.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/console/console.c b/console/console.c
+index e7d7ed58..7f91417d 100644
+--- a/console/console.c
++++ b/console/console.c
+@@ -1615,7 +1615,7 @@ netfs_append_args (char **argz, size_t *argz_len)
+   if (!err && cons->width != DEFAULT_WIDTH)
+     {
+       char *buf;
+-      if (asprintf (&buf, "--width=%d", cons->lines) < 0)
++      if (asprintf (&buf, "--width=%d", cons->width) < 0)
+ 	err = ENOMEM;
+       else
+ 	err = argz_add (argz, argz_len, buf);
+-- 
+2.43.0
+

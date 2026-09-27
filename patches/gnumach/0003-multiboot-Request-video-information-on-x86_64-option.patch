@@ -1,0 +1,131 @@
+From 163fcb1fd7c62fd338fd15a5b86ddf8ac7f0d24e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 16:31:59 +0000
+Subject: [PATCH 3/3] multiboot: Request video information on x86_64,
+ optionally prefer a framebuffer
+
+Commit 7ea3a05d ("multiboot: Support graphic mode preferences") only
+changed the i386 boot header, so the x86_64 kernel still sets no
+MULTIBOOT_VIDEO_MODE flag and never receives framebuffer information.
+Add the flag and the video fields to x86_64/boothdr.S as well.
+
+Now that the kernel console can draw on a framebuffer, add
+--enable-linear-fb to ask the boot loader for a linear framebuffer
+instead of EGA text.  This is what makes GRUB on coreboot with a
+framebuffer (e.g. Libreboot) pass the framebuffer on: with a text
+preference it reports an EGA text buffer the hardware does not have.
+EGA text stays the default.
+---
+ configure.ac                       |  7 +++++++
+ i386/i386at/boothdr.S              |  8 ++++----
+ i386/include/mach/i386/multiboot.h | 17 +++++++++++++++++
+ x86_64/boothdr.S                   | 14 ++++++++++++--
+ 4 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index c3d5ffaac..cb1bcf8f6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -157,6 +157,13 @@ AS_HELP_STRING([--enable-user32], [enable 32-bit user space on a 64-bit kernel])
+   AM_CONDITIONAL([enable_user32], [false])
+ [fi]
+ 
++AC_ARG_ENABLE([linear-fb],
++AS_HELP_STRING([--enable-linear-fb], [ask the boot loader for a linear framebuffer
++  instead of EGA text mode, and draw the kernel console on it]))
++[if [ x"$enable_linear_fb" = xyes ]; then]
++  AC_DEFINE([LINEAR_FB], [1], [prefer a linear framebuffer console])
++[fi]
++
+ 
+ # Platform-specific configuration.
+ 
+diff --git a/i386/i386at/boothdr.S b/i386/i386at/boothdr.S
+index 40122bb12..22b29a671 100644
+--- a/i386/i386at/boothdr.S
++++ b/i386/i386at/boothdr.S
+@@ -49,10 +49,10 @@ boot_hdr:
+         .long	0
+         .long	0
+ #endif /* __ELF__ */
+-        .long	MULTIBOOT_VIDEO_MODE_TYPE_EGA_TEXT
+-        .long	80
+-        .long	25
+-        .long	MULTIBOOT_VIDEO_PARAM_NO_PREFERENCE
++        .long	MULTIBOOT_PREFERRED_MODE_TYPE
++        .long	MULTIBOOT_PREFERRED_WIDTH
++        .long	MULTIBOOT_PREFERRED_HEIGHT
++        .long	MULTIBOOT_PREFERRED_DEPTH
+ 
+ boot_entry:
+ 	movl	$percpu_array - KERNELBASE, %eax
+diff --git a/i386/include/mach/i386/multiboot.h b/i386/include/mach/i386/multiboot.h
+index 085fcaad4..4adae1a00 100644
+--- a/i386/include/mach/i386/multiboot.h
++++ b/i386/include/mach/i386/multiboot.h
+@@ -72,6 +72,23 @@
+ 
+ #define MULTIBOOT_VIDEO_PARAM_NO_PREFERENCE	0
+ 
++/* Video mode the kernel asks the boot loader for.  A linear framebuffer is
++   only requested when the kernel console can draw on one; EGA text stays the
++   default so that existing setups keep their console.  */
++#ifdef MACH_KERNEL
++#ifdef LINEAR_FB
++#define MULTIBOOT_PREFERRED_MODE_TYPE	MULTIBOOT_VIDEO_MODE_TYPE_LINEARFB
++#define MULTIBOOT_PREFERRED_WIDTH	MULTIBOOT_VIDEO_PARAM_NO_PREFERENCE
++#define MULTIBOOT_PREFERRED_HEIGHT	MULTIBOOT_VIDEO_PARAM_NO_PREFERENCE
++#define MULTIBOOT_PREFERRED_DEPTH	32
++#else
++#define MULTIBOOT_PREFERRED_MODE_TYPE	MULTIBOOT_VIDEO_MODE_TYPE_EGA_TEXT
++#define MULTIBOOT_PREFERRED_WIDTH	80
++#define MULTIBOOT_PREFERRED_HEIGHT	25
++#define MULTIBOOT_PREFERRED_DEPTH	MULTIBOOT_VIDEO_PARAM_NO_PREFERENCE
++#endif /* LINEAR_FB */
++#endif /* MACH_KERNEL */
++
+ #ifndef __ASSEMBLER__
+ 
+ #include <mach/machine/vm_types.h>
+diff --git a/x86_64/boothdr.S b/x86_64/boothdr.S
+index 98f1cab2d..41634b495 100644
+--- a/x86_64/boothdr.S
++++ b/x86_64/boothdr.S
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include <mach/machine/asm.h>
++#include <mach/machine/multiboot.h>
+ 
+ #include <i386/i386asm.h>
+ #include <i386/i386/proc_reg.h>
+@@ -40,8 +41,7 @@ boot_start:
+ 	jmp	boot_entry
+ 
+ 	/* MultiBoot header - see multiboot.h.	*/
+-#define	MULTIBOOT_MAGIC		0x1BADB002
+-#define MULTIBOOT_FLAGS		0x00000003
++#define MULTIBOOT_FLAGS	(MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_VIDEO_MODE)
+ 	P2ALIGN(2)
+ boot_hdr:
+ 	.long	MULTIBOOT_MAGIC
+@@ -51,6 +51,16 @@ boot_hdr:
+ 	* XX this works OK until we need at least the 30th bit.
+ 	*/
+ 	.long	- (MULTIBOOT_MAGIC+MULTIBOOT_FLAGS)
++	/* Address fields, unused for ELF but needed to place the video fields.  */
++	.long	0
++	.long	0
++	.long	0
++	.long	0
++	.long	0
++	.long	MULTIBOOT_PREFERRED_MODE_TYPE
++	.long	MULTIBOOT_PREFERRED_WIDTH
++	.long	MULTIBOOT_PREFERRED_HEIGHT
++	.long	MULTIBOOT_PREFERRED_DEPTH
+ 
+ 	.global _start
+ _start:
+-- 
+2.43.0
+
