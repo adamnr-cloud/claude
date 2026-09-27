@@ -47,6 +47,20 @@
                     read-string)))
     (grub.cfg->hurd-menuentries grub.cfg)))
 
+;; This Hurd root was installed from Linux, which cannot set its passive
+;; translators, so its first boot fails in console-run while ext2fs holds
+;; the root read-only.  Start ext2fs writable; runsystem still switches /
+;; to read-only for fsck and back to writable afterwards.
+(define (without-readonly-root entry)
+  (menu-entry
+    (inherit entry)
+    (multiboot-modules
+      (map (lambda (module)
+             (if (string-suffix? "/ext2fs.static" (car module))
+                 (delete "--readonly" module)
+                 module))
+           (menu-entry-multiboot-modules entry)))))
+
 ;; Test entry: the same Hurd entry, booting the framebuffer-console kernel
 ;; copied to /hurd/boot/gnumach-fb (from the gnumach/fb package of
 ;; /home/adam/hurd-fb).  Only added while that file exists.
@@ -129,7 +143,7 @@
       (keyboard-layout keyboard-layout)
       (menu-entries
         (if (file-exists? "/hurd/boot/grub/grub.cfg")
-            (let ((entries (hurd-menuentries)))
+            (let ((entries (map without-readonly-root (hurd-menuentries))))
               (if (file-exists? %hurd-fb-test-kernel)
                   (append entries (map fb-test-entry entries))
                   entries))
