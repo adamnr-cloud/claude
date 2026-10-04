@@ -10,12 +10,14 @@
 (define-module (hurd-fb)
   #:use-module (guix packages)
   #:use-module (guix gexp)
+  #:use-module (guix git-download)
   #:use-module (guix utils)
   #:use-module (gnu packages hurd)
   #:use-module (gnu services)
   #:use-module (gnu services hurd)
   #:use-module (gnu system)
   #:export (gnumach/fb
+            rumpkernel/debian-9
             hurd/fb
             hurd-fb-services
             operating-system-with-fb-console))
@@ -43,9 +45,42 @@
        ((#:configure-flags flags ''())
         `(cons "--enable-linear-fb" ,flags))))))
 
+(define rumpkernel/debian-9
+  ;; Debian's rumpkernel packaging at 0~20250111-9, which adds Michael
+  ;; Kelly's DMA bounce buffer support (patches/dma_bounce_buffers.diff) for
+  ;; rumpdisk on real hardware.  Guix itself still packages -6.
+  (let ((commit "9406e1fbbfd3de0a3265046dadb0d9e5e5748a0a")
+        (revision "9"))
+    (package
+      (inherit rumpkernel)
+      (version (git-version "0-20250111" revision commit))
+      (source
+       (origin
+         (method git-fetch)
+         (uri (git-reference
+               (url "https://salsa.debian.org/hurd-team/rumpkernel.git")
+               (commit commit)))
+         ;; Placeholder: the first build fails with "hash mismatch" and
+         ;; prints the actual hash; put that here.
+         (sha256
+          (base32 "0000000000000000000000000000000000000000000000000000"))
+         (file-name (git-file-name "rumpkernel" version))))
+      (arguments
+       (substitute-keyword-arguments (package-arguments rumpkernel)
+         ((#:phases phases)
+          #~(modify-phases #$phases
+              ;; debian/rules defines NOGCCERROR since -9; NetBSD make
+              ;; picks it up from the environment.
+              (add-before 'build 'no-gcc-error
+                (lambda _
+                  (setenv "NOGCCERROR" "yes"))))))))))
+
 (define hurd/fb
   (package
     (inherit hurd)
+    ;; rumpdisk is linked statically against the rump kernel libraries.
+    (inputs (modify-inputs (package-inputs hurd)
+              (replace "rumpkernel" rumpkernel/debian-9)))
     (source
      (origin
        (inherit (package-source hurd))
