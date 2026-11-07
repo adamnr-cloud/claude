@@ -60,10 +60,8 @@
          (uri (git-reference
                (url "https://salsa.debian.org/hurd-team/rumpkernel.git")
                (commit commit)))
-         ;; Placeholder: the first build fails with "hash mismatch" and
-         ;; prints the actual hash; put that here.
          (sha256
-          (base32 "0000000000000000000000000000000000000000000000000000"))
+          (base32 "0z47lrcgkpiinzdy55wy6aaaqwp2r04zbwslda05pw6pi6snsyv7"))
          (file-name (git-file-name "rumpkernel" version))))
       (arguments
        (substitute-keyword-arguments (package-arguments rumpkernel)
