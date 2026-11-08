@@ -144,6 +144,8 @@ Not verified:
   (build instructions at the top of the file).
 - `tests/multiboot-header.py KERNEL` decodes a kernel's multiboot header and
   video preference.
+- `tests/upstream-review.sh [DIR]` clones gnumach, hurd and rumpkernel and
+  lists upstream changes since the versions Guix packages, by area.
 - `tests/mkfont.py` regenerates `kd_fb_font.h` from `unifont.otf`.
 
 ## Upstream
